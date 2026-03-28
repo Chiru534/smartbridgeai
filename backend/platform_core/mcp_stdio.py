@@ -333,3 +333,16 @@ default_mcp_manager.register_server(
     env_overrides=_load_env_json(settings.google_drive_mcp_env_json),
     cwd=_MCP_SERVER_CWD,
 )
+
+# Register Slack MCP server only if a bot token is configured
+if settings.slack_bot_token:
+    _slack_env: dict[str, str] = _load_env_json(settings.slack_mcp_env_json)
+    # Always inject the bot token so the MCP server subprocess can find it
+    _slack_env["SLACK_BOT_TOKEN"] = settings.slack_bot_token
+    default_mcp_manager.register_server(
+        "slack",
+        settings.slack_mcp_command,
+        env_overrides=_slack_env,
+        cwd=_MCP_SERVER_CWD,
+    )
+

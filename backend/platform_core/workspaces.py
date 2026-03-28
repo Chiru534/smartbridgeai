@@ -90,7 +90,21 @@ WORKSPACE_DEFINITIONS: dict[str, WorkspaceDefinition] = {
         allowed_native_tools=(),
         mcp_servers=("google_drive",),
     ),
+    "slack_agent": WorkspaceDefinition(
+        id="slack_agent",
+        label="Slack Agent",
+        short_label="Slack",
+        description="Interact with Slack channels and messages through localized MCP tools.",
+        system_prompt=(
+            "You are in Slack Agent mode. Use Slack tools to search messages, list channels, or post updates. "
+            "Be professional and summarize long threads when asked for a summary."
+        ),
+        recommended_model="llama-3.3-70b-versatile",
+        allowed_native_tools=(),
+        mcp_servers=("slack",),
+    ),
 }
+
 
 
 WORKSPACE_ALIASES = {
@@ -109,7 +123,10 @@ WORKSPACE_ALIASES = {
     "drive": "google_drive_agent",
     "google_drive": "google_drive_agent",
     "google_drive_agent": "google_drive_agent",
+    "slack": "slack_agent",
+    "slack_agent": "slack_agent",
 }
+
 
 
 def normalize_workspace_id(raw_mode: str | None) -> str:

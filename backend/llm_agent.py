@@ -271,17 +271,8 @@ async def get_available_models() -> List[dict]:
         print("Returning cached models")
         return _cached_models
 
-    if llm_client.provider == "ollama":
-        # Force only the local model to be available
-        model_id = llm_client.default_model
-        model_name = "Ollama Local - " + model_id
-        local_model = [{"id": model_id, "name": model_name}]
-        _cached_models = local_model
-        _cache_timestamp = current_time
-        return local_model
-
     try:
-        data = await llm_client.get_models()
+        data = await llm_client.list_models()
         models_to_test = []
         
         for m in data.get("data", []):

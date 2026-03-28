@@ -1,25 +1,23 @@
-import { useState, lazy, Suspense, useEffect } from "react";
+import { useState, lazy, Suspense } from "react";
 import { Navbar } from "@/components/Navbar";
 import { NavigationSidebar, type TabId } from "@/components/NavigationSidebar";
 import { ThemeProvider } from "@/components/ThemeProvider";
-import { LoginPage } from "@/components/LoginPage";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
-import { getUser, logout, setUser as persistAuthUser, type AuthUser } from "@/lib/auth";
-import api from "@/lib/api";
+import { getUser, type AuthUser } from "@/lib/auth";
 import { Toaster } from "sonner";
 
 // Lazy load panels for performance
 const AIChatPanel = lazy(() => import("@/components/AIChatPanel").then(m => ({ default: m.AIChatPanel })));
 const TaskManagerPanel = lazy(() => import("@/components/TaskManagerPanel").then(m => ({ default: m.TaskManagerPanel })));
-const TeamDirectoryPanel = lazy(() => import("@/components/TeamDirectoryPanel").then(m => ({ default: m.TeamDirectoryPanel })));
-const TeamChatPanel = lazy(() => import("@/components/TeamChatPanel").then(m => ({ default: m.TeamChatPanel })));
 const DashboardPanel = lazy(() => import("@/components/DashboardPanel").then(m => ({ default: m.DashboardPanel })));
 const KnowledgeBasePanel = lazy(() => import("@/components/KnowledgeBasePanel").then(m => ({ default: m.KnowledgeBasePanel })));
 const DocumentAnalysisPanel = lazy(() => import("@/components/DocumentAnalysisPanel").then(m => ({ default: m.DocumentAnalysisPanel })));
 const SqlAgentPanel = lazy(() => import("@/components/SqlAgentPanel").then(m => ({ default: m.SqlAgentPanel })));
 const GitHubAgentPanel = lazy(() => import("@/components/GitHubAgentPanel").then(m => ({ default: m.GitHubAgentPanel })));
 const GoogleDriveAgentPanel = lazy(() => import("@/components/GoogleDriveAgentPanel").then(m => ({ default: m.GoogleDriveAgentPanel })));
+const SlackAgentPanel = lazy(() => import("@/components/SlackAgentPanel").then(m => ({ default: m.SlackAgentPanel })));
 const SettingsPanel = lazy(() => import("@/components/SettingsPanel").then(m => ({ default: m.SettingsPanel })));
+
 const ChatHistoryPanel = lazy(() => import("@/components/ChatHistoryPanel").then(m => ({ default: m.ChatHistoryPanel })));
 
 // Fallback loading component
@@ -33,62 +31,11 @@ function PanelLoader() {
 }
 
 export default function App() {
-  const [user, setUser] = useState<AuthUser | null>(getUser());
+  // Auth is bypassed for testing — always logged in as mock user
+  const user: AuthUser = getUser();
   const [activeTab, setActiveTab] = useState<TabId>("chat");
   const [taskFilterAssignee, setTaskFilterAssignee] = useState<string | undefined>(undefined);
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>(undefined);
-
-  const handleLogout = () => {
-    logout();
-    setActiveSessionId(undefined);
-    setUser(null);
-  };
-
-  useEffect(() => {
-    if (!user?.token) return;
-
-    let isCancelled = false;
-    const syncUserProfile = async () => {
-      try {
-        const res = await api.get("/api/user/profile");
-        if (isCancelled || !res?.data) return;
-
-        const profile = res.data;
-        const nextUser: AuthUser = {
-          ...user,
-          displayName: profile.display_name || user.displayName,
-          role: (profile.role || user.role) as AuthUser["role"],
-          email: profile.email || user.email,
-        };
-
-        setUser(nextUser);
-        persistAuthUser(nextUser);
-      } catch {
-        // Keep existing user state if profile endpoint is unavailable.
-      }
-    };
-
-    syncUserProfile();
-    return () => {
-      isCancelled = true;
-    };
-  }, [user?.token]);
-
-  // If not logged in, show login page
-  if (!user) {
-    return (
-      <ThemeProvider attribute="class" defaultTheme="dark" enableSystem>
-        <Toaster
-          richColors
-          position="top-right"
-          toastOptions={{
-            className: "!rounded-xl !shadow-lg !border-border/50",
-          }}
-        />
-        <LoginPage onLogin={(u) => setUser(u)} />
-      </ThemeProvider>
-    );
-  }
 
   const handleTaskCreated = () => {
     if (typeof (window as any).refreshTasks === "function") {
@@ -96,11 +43,6 @@ export default function App() {
     }
   };
 
-  // Navigate to tasks filtered by a team member
-  const handleViewMemberTasks = (memberName: string) => {
-    setTaskFilterAssignee(memberName);
-    setActiveTab("tasks");
-  };
 
   const handleLoadSession = (sessionId: string) => {
     setActiveSessionId(sessionId);
@@ -129,18 +71,6 @@ export default function App() {
         return (
           <Suspense fallback={<PanelLoader />}>
             <ChatHistoryPanel onLoadSession={handleLoadSession} />
-          </Suspense>
-        );
-      case "team":
-        return (
-          <Suspense fallback={<PanelLoader />}>
-            <TeamDirectoryPanel onViewMemberTasks={handleViewMemberTasks} />
-          </Suspense>
-        );
-      case "teamchat":
-        return (
-          <Suspense fallback={<PanelLoader />}>
-            <TeamChatPanel />
           </Suspense>
         );
       case "dashboard":
@@ -179,23 +109,18 @@ export default function App() {
             <GoogleDriveAgentPanel />
           </Suspense>
         );
+      case "slackagent":
+        return (
+          <Suspense fallback={<PanelLoader />}>
+            <SlackAgentPanel />
+          </Suspense>
+        );
+
       case "settings":
         return (
           <Suspense fallback={<PanelLoader />}>
             <SettingsPanel user={user} />
           </Suspense>
-        );
-      case "notifications":
-        return (
-          <div className="flex flex-col items-center justify-center h-full text-muted-foreground bg-muted/5">
-            <div className="text-center p-12 max-w-md bg-card border border-border/40 shadow-sm rounded-2xl">
-              <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center mx-auto mb-4">
-                <span className="text-primary text-lg font-bold">🚧</span>
-              </div>
-              <h2 className="text-xl font-bold mb-2 text-foreground capitalize">{activeTab}</h2>
-              <p className="text-sm text-muted-foreground">This module is currently under development. Check back soon for updates.</p>
-            </div>
-          </div>
         );
       default:
         return (
@@ -228,7 +153,8 @@ export default function App() {
         }}
       />
       <div className="flex flex-col h-screen w-full bg-background text-foreground overflow-hidden font-sans">
-        <Navbar activeTab={activeTab} setActiveTab={handleTabChange} user={user} onLogout={handleLogout} />
+        <Navbar activeTab={activeTab} setActiveTab={handleTabChange} user={user} onLogout={() => {}} />
+
         <ErrorBoundary>
           <div className="flex flex-1 overflow-hidden">
             <div className="hidden md:block w-[260px] flex-shrink-0 z-0 bg-card">

@@ -14,9 +14,9 @@ try:
 except ImportError:
     from database import SessionLocal
 try:
-    from backend.rag import extract_text
+    from app.plugins.rag import extract_text
 except ImportError:
-    from rag import extract_text
+    from app.plugins.rag import extract_text
 from .config import settings
 from .connectors import GOOGLE_DRIVE_API_URL, get_google_access_token
 

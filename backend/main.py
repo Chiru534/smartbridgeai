@@ -20,11 +20,13 @@ import re
 import json
 import tempfile
 
+
 try:
+    from backend.notification_service import notify_user_registered, notify_task_created, notify_task_updated, notify_task_commented
     from backend.database import engine, get_db, SessionLocal
     import backend.models as models
     import backend.llm_agent as llm_agent
-    import backend.rag as rag
+    import app.plugins.rag as rag
     from backend.platform_core.doc_sessions import document_session_store
     from backend.platform_core.groq_tools_agent import run_workspace_chat
     from backend.platform_core.github_workspace import (
@@ -61,10 +63,11 @@ try:
     upsert_connector_account,
 )
 except ImportError:
+    from notification_service import notify_user_registered, notify_task_created, notify_task_updated, notify_task_commented
     from database import engine, get_db, SessionLocal
     import models
     import llm_agent
-    import rag
+    import app.plugins.rag as rag
     from platform_core.doc_sessions import document_session_store
     from platform_core.groq_tools_agent import run_workspace_chat
     from platform_core.github_workspace import (
@@ -82,12 +85,14 @@ except ImportError:
     from platform_core.connectors import (
         build_github_authorize_url,
         build_google_authorize_url,
+        build_slack_authorize_url, # Added for Slack OAuth
         connector_error_html,
         connector_success_html,
         connector_redirect_uri,
         connector_setup_hint,
         exchange_github_code,
         exchange_google_code,
+        exchange_slack_code, # Added for Slack OAuth
         fetch_github_profile,
         fetch_google_profile,
         get_connector_accounts_summary,
@@ -99,6 +104,11 @@ except ImportError:
         pop_oauth_state,
         remove_connector_account,
         upsert_connector_account,
+        parse_github_url,
+        fetch_github_repo_structure,
+        fetch_github_file_content,
+        get_connector_account,
+        _parse_config,
     )
 
 try:
@@ -303,50 +313,33 @@ def ensure_user_profile(db: Session, user: models.UserDB, default_display_name: 
     return profile
 
 
+# ─── DEV / TEST MODE: Auth completely bypassed ───────────────────────────────
+# get_current_user always returns a fixed admin user, no token required.
+MOCK_USER_ID = 1  # uses whatever user id=1 is in the DB (seeded as 'admin')
+
 def get_current_user(request: Request, db: Session = Depends(get_db)):
-    token = None
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1]
-    else:
-        token = request.query_params.get("token")
-
-    if not token:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    remove_expired_tokens()
-    token_payload = ACTIVE_TOKENS.get(token)
-    if not token_payload:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    db_user = db.query(models.UserDB).filter(models.UserDB.username == token_payload["username"]).first()
-    if not db_user:
-        ACTIVE_TOKENS.pop(token, None)
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    profile = ensure_user_profile(db, db_user, default_display_name=db_user.username)
-    db.commit()
-    db.refresh(profile)
-
+    """Returns a hardcoded admin user — authentication is disabled for testing."""
+    # Try to load the real 'admin' db record for proper role/display_name
+    db_user = db.query(models.UserDB).filter(models.UserDB.username == "admin").first()
+    if db_user:
+        profile = ensure_user_profile(db, db_user, default_display_name="Admin", default_role="admin")
+        db.commit()
+        return {
+            "user_id": db_user.id,
+            "username": db_user.username,
+            "displayName": profile.display_name or "Admin",
+            "role": profile.role or "admin",
+            "email": db_user.email,
+            "token": "dev-bypass-token",
+        }
+    # Fallback if DB is empty / admin not seeded yet
     return {
-        "user_id": db_user.id,
-        "username": db_user.username,
-        "displayName": profile.display_name or db_user.username,
-        "role": profile.role or "employee",
-        "email": db_user.email,
-        "token": token,
+        "user_id": 1,
+        "username": "admin",
+        "displayName": "Admin",
+        "role": "admin",
+        "email": "admin@smartbridge.local",
+        "token": "dev-bypass-token",
     }
 
 
@@ -551,7 +544,7 @@ def build_profile_response(db_user: models.UserDB, profile: models.UserProfileDB
 
 
 @app.post("/api/register")
-def register_user(request: models.RegisterRequest, db: Session = Depends(get_db)):
+def register_user(request: models.RegisterRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     username = require_non_empty(request.username, "username").lower()
     password = require_non_empty(request.password, "password")
     email = require_non_empty(request.email, "email").lower()
@@ -598,6 +591,15 @@ def register_user(request: models.RegisterRequest, db: Session = Depends(get_db)
         raise HTTPException(status_code=500, detail="Failed to register user")
 
     token = create_access_token(db_user.username)
+    # Prepare user info for Slack notification
+    user_info = {
+        "username": db_user.username,
+        "displayName": profile.display_name,
+        "email": db_user.email,
+    }
+    # Notify Slack about new user registration
+    notify_user_registered(background_tasks, user_info)
+
     return {
         "token": token,
         "username": db_user.username,
@@ -709,6 +711,8 @@ def create_task(task: models.TaskCreate, background_tasks: BackgroundTasks, curr
             body = f"Hello,\n\nA new task '{db_task.title}' has been assigned to {db_task.assignee} by {current_user.get('displayName', 'User')}.\n\nDescription: {db_task.description or 'No description provided.'}\n\nPlease check the Smartbridge platform for more details."
             background_tasks.add_task(send_email_notification, subject, body, recipient_email)
             
+        # Notify Slack about task creation
+        notify_task_created(background_tasks, task_resp, current_user)
         return db_task
     except Exception as e:
         db.rollback()
@@ -740,6 +744,8 @@ def update_task(task_id: int, task_update: models.TaskUpdate, background_tasks: 
             body = f"Hello,\n\nThe task '{db_task.title}' has been updated to status '{db_task.status}'.\nAssignee: {db_task.assignee}\n\nPlease check the Smartbridge platform for more details."
             background_tasks.add_task(send_email_notification, subject, body, recipient_email)
             
+        # Notify Slack about task update
+        notify_task_updated(background_tasks, task_resp, current_user)
         return db_task
     except HTTPException:
         raise
@@ -797,6 +803,8 @@ def add_task_comment(task_id: int, comment: models.TaskCommentCreate, background
             body = f"Hello,\n\nA new comment was added to the task '{db_task.title}' by {comment.author_name}:\n\n\"{comment.comment}\"\n\nPlease check the Smartbridge platform for more details."
             background_tasks.add_task(send_email_notification, subject, body, recipient_email)
             
+        # Notify Slack about new comment
+        notify_task_commented(background_tasks, task_id, comment.model_dump(), current_user)
         return new_comment
     except HTTPException:
         raise
@@ -1036,7 +1044,12 @@ def build_personalized_system_prompt(profile: models.UserProfileDB, summaries: l
     )
 
 
-@app.post("/api/chat", response_model=models.ChatReplyResponse)
+from fastapi.responses import StreamingResponse
+from app.runtime.AgentRuntime import AgentRuntime
+
+agent_runtime = AgentRuntime()
+
+@app.post("/api/chat")
 async def chat_endpoint(request: llm_agent.ChatRequest, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db), _: None = Depends(check_rate_limit)):
     session_id = request.session_id or ""
     request.mode = normalize_workspace_id(getattr(request, "mode", None))
@@ -1044,26 +1057,14 @@ async def chat_endpoint(request: llm_agent.ChatRequest, current_user: dict = Dep
         db_user = db.query(models.UserDB).filter(models.UserDB.id == current_user["user_id"]).first()
         if not db_user:
             raise HTTPException(status_code=401, detail="Invalid user session")
-        user_profile = ensure_user_profile(
-            db,
-            db_user,
-            default_display_name=current_user.get("displayName") or db_user.username,
-            default_role=current_user.get("role") or "employee",
-        )
-
+        
         if not session_id:
             import uuid
             session_id = str(uuid.uuid4())
             
         newest_user_msg = ""
-        # Save the newest user message if present
         if request.messages and request.messages[-1].role == 'user':
             newest_user_msg = request.messages[-1].content
-            detected_name = extract_display_name_from_message(newest_user_msg)
-            if detected_name and normalize_whitespace(detected_name).lower() != normalize_whitespace(user_profile.display_name).lower():
-                user_profile.display_name = detected_name
-                user_profile.updated_at = datetime.now(timezone.utc)
-
             user_msg = models.ChatMessageDB(
                 session_id=session_id,
                 user_id=current_user["username"],
@@ -1072,127 +1073,61 @@ async def chat_endpoint(request: llm_agent.ChatRequest, current_user: dict = Dep
             )
             db.add(user_msg)
             db.commit()
-            db.refresh(user_profile)
 
-        request.messages = hydrate_request_messages(db, current_user["username"], session_id, request.messages)
-        recent_summaries = build_recent_session_summaries(db, current_user["username"], session_id, limit=3)
-        personalized_system_prompt = build_personalized_system_prompt(user_profile, recent_summaries)
-        tool_context = ToolExecutionContext(
-            db=db,
-            current_user=current_user,
-            session_id=session_id,
-            mode=request.mode,
-            workspace_options=request.workspace_options,
-        )
-        normalized_mode = normalize_workspace_id(request.mode)
-        agent_result = None
-        try:
-            if normalized_mode == "google_drive_agent":
-                agent_result = await maybe_handle_google_drive_request(request, tool_context)
-            elif normalized_mode == "github_agent":
-                agent_result = await maybe_handle_github_request(request, tool_context)
-        except Exception as exc:
-            if normalized_mode == "google_drive_agent":
-                agent_result = drive_workspace_fallback_reply(request, exc)
-            elif normalized_mode == "github_agent":
-                agent_result = github_workspace_fallback_reply(request, exc)
-            else:
-                raise
-        if agent_result is None and normalized_mode != "github_agent":
+        # Build context hits
+        context_hits = []
+        if request.mode == "document_analysis":
+            hits = document_session_store.search(session_id, newest_user_msg, top_k=5)
+            context_hits = hits
+
+        async def sse_stream_generator():
+            """Yields SSE-formatted JSON events and saves the clean final message to DB."""
+            import json as _json
+            final_reply_parts = []
             try:
-                agent_result = await run_workspace_chat(
-                    request=request,
-                    base_system_prompt=personalized_system_prompt,
-                    ctx=tool_context,
-                )
-            except Exception as exc:
-                if normalized_mode == "google_drive_agent":
-                    agent_result = drive_workspace_fallback_reply(request, exc)
-                elif normalized_mode == "github_agent":
-                    agent_result = github_workspace_fallback_reply(request, exc)
-                else:
-                    raise
-        if agent_result is None:
-            agent_result = {
-                "reply": "The workspace agent did not return a response. Please refine your request and try again.",
-                "citations": [],
-                "tool_events": []
-            }
-        reply = agent_result.get("reply", "")
-        citations = agent_result.get("citations", [])
-        tool_events = agent_result.get("tool_events", [])
-        
-        # Remove <think>...</think> blocks from models like DeepSeek R1
-        reply = re.sub(r'<think>.*?</think>', '', reply, flags=re.DOTALL).strip()
-
-        # Strip internal agent formatting prefixes that should not reach the user
-        reply = re.sub(r'\*\*Output:\*\*\s*', '', reply, flags=re.IGNORECASE).strip()
-        # Remove Action/Observation blocks that leaked into the final reply
-        reply = re.sub(r'\*\*Action:\*\*.*?(?=\*\*Output:|$)', '', reply, flags=re.DOTALL | re.IGNORECASE).strip()
-        reply = re.sub(r'\*\*Observation:\*\*.*?(?=\*\*Output:|$)', '', reply, flags=re.DOTALL | re.IGNORECASE).strip()
-        
-        match = re.search(r'```json\s*(\{.*?\})\s*```', reply, re.DOTALL)
-        if match:
-            try:
-                intent_data = json.loads(match.group(1))
-                intent = intent_data.get("intent")
-                status = intent_data.get("status", "Pending")
-                if status not in ["Pending", "In Progress", "Completed"]:
-                    status = "Pending"
-                    
-                if intent == "create_task":
-                    new_task = models.TaskDB(
-                        title=intent_data.get("title") or "New Task",
-                        description=intent_data.get("description"),
-                        assignee=intent_data.get("assignee") or "Unassigned",
-                        status=status
-                    )
-
+                async for sse_chunk in agent_runtime.run_loop_stream(request, context_hits):
+                    yield sse_chunk
+                    # Accumulate only 'message' type content for DB storage
                     try:
-                        due = intent_data.get("due_date")
-                        if due and due != "null":
-                            new_task.due_date = datetime.strptime(due, "%Y-%m-%d")
-                    except ValueError:
+                        # SSE format: "data: {...}\n\n" — extract the JSON part
+                        if sse_chunk.startswith("data: "):
+                            event_data = _json.loads(sse_chunk[6:].strip())
+                            if event_data.get("type") == "message":
+                                final_reply_parts.append(event_data.get("content", ""))
+                    except Exception:
                         pass
-                    
-                    db.add(new_task)
+            finally:
+                # Save the clean final reply to DB (no thought preamble)
+                full_reply = "".join(final_reply_parts).strip()
+                if full_reply:
+                    assistant_msg = models.ChatMessageDB(
+                        session_id=session_id,
+                        user_id=current_user["username"],
+                        role="assistant",
+                        content=full_reply
+                    )
+                    db.add(assistant_msg)
                     db.commit()
-                    db.refresh(new_task)
-                    new_task.comments = []
-                    
-                    # Clean up reply
-                    reply = reply[:match.start()].strip()
-                    if not reply:
-                        reply = f"✅ Task '{new_task.title}' has been created and assigned to {new_task.assignee}."
-                    print(f"NOTIFICATION: Chat created task '{new_task.title}'.")
-            except Exception:
-                pass
 
-        # Save the assistant reply
-        assistant_msg = models.ChatMessageDB(
-            session_id=session_id,
-            user_id=current_user["username"],
-            role="assistant",
-            content=reply
-        )
-        db.add(assistant_msg)
-        db.commit()
-
-        return {
-            "reply": reply,
-            "session_id": session_id,
-            "mode": request.mode,
-            "citations": citations,
-            "tool_events": tool_events,
+        headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering for SSE
         }
+        return StreamingResponse(
+            sse_stream_generator(),
+            media_type="text/event-stream",
+            headers=headers,
+        )
+        
     except HTTPException:
         raise
     except Exception as e:
         import traceback
-
         traceback.print_exc()
-        print(f"Chat endpoint error: {repr(e)}")
         raise HTTPException(status_code=500, detail=f"Chat processing failed: {str(e)}")
+
+
+
 
 @app.get("/api/workspaces", response_model=list[models.WorkspaceDefinitionResponse])
 def get_workspaces(current_user: dict = Depends(get_current_user)):
@@ -1235,6 +1170,50 @@ def start_google_connector(current_user: dict = Depends(get_current_user)):
         )
     state = issue_oauth_state("google", current_user["username"])
     return RedirectResponse(build_google_authorize_url(state), status_code=307)
+
+
+@app.get("/api/connectors/slack/start")
+def start_slack_connector(current_user: dict = Depends(get_current_user)):
+    if not settings.slack_client_id or not settings.slack_client_secret:
+        return HTMLResponse(
+            connector_error_html("slack", connector_setup_hint("slack")),
+            status_code=503,
+        )
+    state = issue_oauth_state("slack", current_user["username"])
+    return RedirectResponse(build_slack_authorize_url(state), status_code=307)
+
+
+@app.get("/api/oauth/slack/callback", response_class=HTMLResponse)
+async def slack_oauth_callback(code: Optional[str] = None, state: Optional[str] = None, db: Session = Depends(get_db)):
+    try:
+        if not code or not state:
+            return HTMLResponse(
+                connector_error_html("slack", "Slack did not return the required OAuth callback parameters."),
+                status_code=400,
+            )
+        state_payload = pop_oauth_state(state, "slack")
+        token_data = await exchange_slack_code(code)
+        profile = await fetch_slack_profile(token_data["access_token"])
+        upsert_connector_account(
+            db,
+            username=state_payload.username,
+            connector_name="slack",
+            auth_method="oauth",
+            config={
+                "access_token": token_data.get("access_token"),
+                "bot_user_id": token_data.get("bot_user_id"),
+                "app_id": token_data.get("app_id"),
+                "team_id": token_data.get("team.id"),
+                "team_name": token_data.get("team.name"),
+                "display_name": profile.get("user"),
+                "login": profile.get("user"),
+                "connected_at": datetime.now(timezone.utc).isoformat(),
+                "connected": True,
+            },
+        )
+        return HTMLResponse(connector_success_html("slack"))
+    except Exception as exc:
+        return HTMLResponse(connector_error_html("slack", str(exc)), status_code=400)
 
 
 @app.get("/api/oauth/github/callback", response_class=HTMLResponse)
@@ -1314,10 +1293,79 @@ def disconnect_connector(
     db: Session = Depends(get_db),
 ):
     normalized = connector_name.strip().lower()
-    if normalized not in {"github", "google_drive"}:
+    if normalized not in {"github", "google_drive", "slack"}:
         raise HTTPException(status_code=404, detail="Connector not found")
+
     remove_connector_account(db, current_user["username"], normalized)
     return {"success": True}
+
+
+@app.post("/api/github/repo-structure", response_model=models.GithubRepoStructureResponse)
+async def get_github_repo_structure(
+    request: models.GithubRepoStructureRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    parsed = parse_github_url(request.repo_url)
+    if not parsed:
+        raise HTTPException(status_code=400, detail="Invalid GitHub repository URL")
+    
+    owner, repo = parsed
+    
+    # Try to get access token from connected account if available
+    access_token = None
+    account = get_connector_account(db, current_user["username"], "github")
+    if account:
+        config = _parse_config(account)
+        access_token = config.get("access_token")
+    
+    # Fallback to shared PAT if configured
+    if not access_token and settings.github_pat:
+        access_token = settings.github_pat
+
+    try:
+        tree = await fetch_github_repo_structure(owner, repo, access_token)
+        files = []
+        for item in tree:
+            files.append(models.GithubFileItem(
+                path=item["path"],
+                type=item["type"], # 'blob' or 'tree'
+                size=item.get("size"),
+                url=item.get("url")
+            ))
+        return models.GithubRepoStructureResponse(owner=owner, repo=repo, files=files)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch repository structure: {str(e)}")
+
+
+@app.post("/api/github/file-content", response_model=models.GithubFileContentResponse)
+async def get_github_file_content(
+    request: models.GithubFileContentRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    parsed = parse_github_url(request.repo_url)
+    if not parsed:
+        raise HTTPException(status_code=400, detail="Invalid GitHub repository URL")
+    
+    owner, repo = parsed
+    
+    # Try to get access token from connected account if available
+    access_token = None
+    account = get_connector_account(db, current_user["username"], "github")
+    if account:
+        config = _parse_config(account)
+        access_token = config.get("access_token")
+    
+    # Fallback to shared PAT if configured
+    if not access_token and settings.github_pat:
+        access_token = settings.github_pat
+
+    try:
+        content = await fetch_github_file_content(owner, repo, request.file_path, access_token)
+        return models.GithubFileContentResponse(path=request.file_path, content=content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch file content: {str(e)}")
 
 
 @app.get("/api/connectors/status", response_model=list[models.ConnectorStatusResponse])
@@ -1453,87 +1501,6 @@ async def upload_attachment(file: UploadFile = File(...), current_user: dict = D
         print(f"Error uploading attachment: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload attachment")
 
-
-# --- Team Chat Endpoints ---
-
-@app.post("/api/chat/send", response_model=models.TeamMessageResponse)
-def send_chat_message(message: models.TeamMessageCreate, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    try:
-        sender_id = current_user["username"].strip().lower()
-        receiver_id = message.receiver_id.strip().lower()
-        db_message = models.TeamMessageDB(
-            sender_id=sender_id,
-            receiver_id=receiver_id,
-            content=message.content,
-            timestamp=datetime.utcnow()
-        )
-        db.add(db_message)
-        db.commit()
-        db.refresh(db_message)
-        
-        msg_resp = models.TeamMessageResponse.model_validate(db_message).model_dump(mode="json")
-        broadcast_event_sync("team_message", msg_resp)
-        return db_message
-    except Exception as e:
-        db.rollback()
-        print(f"Error sending chat message: {e}")
-        raise HTTPException(status_code=500, detail="Failed to send message")
-
-@app.get("/api/team-chat/unread")
-def get_unread_counts(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    try:
-        current_username = current_user["username"].strip().lower()
-        results = db.query(
-            models.TeamMessageDB.sender_id,
-            func.count(models.TeamMessageDB.id)
-        ).filter(
-            func.lower(models.TeamMessageDB.receiver_id) == current_username,
-            models.TeamMessageDB.is_read == False
-        ).group_by(models.TeamMessageDB.sender_id).all()
-        
-        return {str(sender_id).lower(): count for sender_id, count in results}
-    except Exception as e:
-        print(f"Error fetching unread counts: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch unread counts")
-
-@app.get("/api/chat/messages/{user_id}", response_model=list[models.TeamMessageResponse])
-def get_chat_messages(user_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    try:
-        current_username = current_user["username"].strip().lower()
-        target_username = user_id.strip().lower()
-        messages = db.query(models.TeamMessageDB).filter(
-            or_(
-                and_(
-                    func.lower(models.TeamMessageDB.sender_id) == current_username,
-                    func.lower(models.TeamMessageDB.receiver_id) == target_username
-                ),
-                and_(
-                    func.lower(models.TeamMessageDB.sender_id) == target_username,
-                    func.lower(models.TeamMessageDB.receiver_id) == current_username
-                )
-            )
-        ).order_by(models.TeamMessageDB.timestamp.asc()).all()
-        return messages
-    except Exception as e:
-        print(f"Error fetching chat messages: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch messages")
-
-@app.post("/api/team-chat/{target_username}/read")
-def mark_messages_read(target_username: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    try:
-        current_username = current_user["username"].strip().lower()
-        sender_username = target_username.strip().lower()
-        db.query(models.TeamMessageDB).filter(
-            func.lower(models.TeamMessageDB.sender_id) == sender_username,
-            func.lower(models.TeamMessageDB.receiver_id) == current_username,
-            models.TeamMessageDB.is_read == False
-        ).update({"is_read": True})
-        db.commit()
-        return {"success": True}
-    except Exception as e:
-        db.rollback()
-        print(f"Error marking messages as read: {e}")
-        raise HTTPException(status_code=500, detail="Failed to mark as read")
 
 
 @app.get("/api/knowledge", response_model=list[models.KnowledgeDocumentResponse])

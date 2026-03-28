@@ -40,6 +40,9 @@ class AppSettings:
     github_mcp_env_json: str = field(default_factory=lambda: (os.getenv("GITHUB_MCP_ENV_JSON") or "").strip())
     google_drive_mcp_command: list[str] = field(default_factory=lambda: _split_command(os.getenv("GOOGLE_DRIVE_MCP_COMMAND") or "python -m backend.platform_core.google_drive_mcp_server"))
     google_drive_mcp_env_json: str = field(default_factory=lambda: (os.getenv("GOOGLE_DRIVE_MCP_ENV_JSON") or "").strip())
+    slack_bot_token: str = field(default_factory=lambda: (os.getenv("SLACK_BOT_TOKEN") or "").strip())
+    slack_mcp_command: list[str] = field(default_factory=lambda: _split_command(os.getenv("SLACK_MCP_COMMAND") or "npx -y @modelcontextprotocol/server-slack"))
+    slack_mcp_env_json: str = field(default_factory=lambda: (os.getenv("SLACK_MCP_ENV_JSON") or "").strip())
     document_session_ttl_hours: int = field(default_factory=lambda: int(os.getenv("DOCUMENT_SESSION_TTL_HOURS") or "2"))
     sql_agent_row_limit: int = field(default_factory=lambda: int(os.getenv("SQL_AGENT_ROW_LIMIT") or "200"))
     sql_agent_timeout_ms: int = field(default_factory=lambda: int(os.getenv("SQL_AGENT_TIMEOUT_MS") or "5000"))
@@ -60,6 +63,9 @@ class AppSettings:
             or "openid email profile https://www.googleapis.com/auth/drive"
         ).strip()
     )
+    slack_client_id: str = field(default_factory=lambda: (os.getenv("SLACK_CLIENT_ID") or "").strip())
+    slack_client_secret: str = field(default_factory=lambda: (os.getenv("SLACK_CLIENT_SECRET") or "").strip())
+    slack_oauth_scope: str = field(default_factory=lambda: (os.getenv("SLACK_OAUTH_SCOPE") or "channels:read chat:write users:read groups:read").strip())
 
     @property
     def is_postgres(self) -> bool:

@@ -75,14 +75,6 @@ class UserSettingsDB(Base):
     username = Column(String, primary_key=True, index=True)
     notification_preference = Column(String, default="email")
 
-class TeamMessageDB(Base):
-    __tablename__ = "team_messages"
-    id = Column(Integer, primary_key=True, index=True)
-    sender_id = Column(String, index=True)
-    receiver_id = Column(String, index=True)
-    content = Column(String)
-    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    is_read = Column(Boolean, default=False)
 
 
 class AuditLogDB(Base):
@@ -238,22 +230,6 @@ class UserProfileUpdate(BaseModel):
     preferred_tone: Optional[str] = Field(None, min_length=1, max_length=100, json_schema_extra={"strip_whitespace": True})
     email: Optional[str] = Field(None, min_length=5, max_length=255, json_schema_extra={"strip_whitespace": True})
 
-class TeamMessageCreate(BaseModel):
-    receiver_id: str
-    content: str
-    
-class TeamMessageResponse(BaseModel):
-    id: int
-    sender_id: str
-    receiver_id: str
-    content: str
-    timestamp: datetime
-    is_read: bool
-
-    model_config = ConfigDict(from_attributes=True)
-
-class UnreadCountResponse(BaseModel):
-    unread_count: int
 
 
 class CitationResponse(BaseModel):
@@ -317,3 +293,26 @@ class ChatReplyResponse(BaseModel):
     mode: str
     citations: list[CitationResponse] = Field(default_factory=list)
     tool_events: list[ToolEventResponse] = Field(default_factory=list)
+
+class GithubRepoStructureRequest(BaseModel):
+    repo_url: str
+
+class GithubFileContentRequest(BaseModel):
+    repo_url: str
+    file_path: str
+
+class GithubFileItem(BaseModel):
+    path: str
+    type: str
+    size: Optional[int] = None
+    url: Optional[str] = None
+
+class GithubRepoStructureResponse(BaseModel):
+    owner: str
+    repo: str
+    files: List[GithubFileItem]
+
+class GithubFileContentResponse(BaseModel):
+    path: str
+    content: str
+    encoding: str = "utf-8"

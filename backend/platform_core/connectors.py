@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+import re
 from sqlalchemy.orm import Session
 
 try:
@@ -35,6 +36,9 @@ GOOGLE_DRIVE_CONTENT_SCOPES = {
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/drive.readonly",
 }
+SLACK_AUTHORIZE_URL = "https://slack.com/oauth/v2/authorize"
+SLACK_TOKEN_URL = "https://slack.com/api/oauth.v2.access"
+
 
 
 @dataclass
@@ -82,7 +86,11 @@ def connector_redirect_uri(connector_name: str) -> str:
 
 
 def connector_display_name(connector_name: str) -> str:
-    return "Google Drive" if connector_name == "google_drive" else "GitHub"
+    if connector_name == "google_drive": return "Google Drive"
+    if connector_name == "github": return "GitHub"
+    if connector_name == "slack": return "Slack"
+    return connector_name.capitalize()
+
 
 
 def is_connector_oauth_configured(connector_name: str) -> bool:
@@ -90,7 +98,10 @@ def is_connector_oauth_configured(connector_name: str) -> bool:
         return bool(settings.github_client_id and settings.github_client_secret)
     if connector_name == "google_drive":
         return bool(settings.google_client_id and settings.google_client_secret)
+    if connector_name == "slack":
+        return bool(settings.slack_client_id and settings.slack_client_secret)
     return False
+
 
 
 def is_connector_pat_configured(connector_name: str) -> bool:
@@ -149,10 +160,17 @@ def connector_setup_hint(connector_name: str) -> str:
             "A Google service account is configured, but the 'google-auth' package is not available in the backend environment. "
             "Install google-auth to enable direct Drive access."
         )
+    if connector_name == "slack":
+        callback_uri = connector_redirect_uri("slack")
+        return (
+            f"Create a Slack App and set its Redirect URL to {callback_uri}. "
+            "Then place the Client ID and Client Secret in backend/.env."
+        )
     return (
         f"Create a Google OAuth client and add {callback_uri} as an authorized redirect URI. "
         "Then place the Google client ID and client secret in backend/.env, or configure a service account JSON key for direct Drive access."
     )
+
 
 
 def build_github_authorize_url(state: str) -> str:
@@ -177,6 +195,17 @@ def build_google_authorize_url(state: str) -> str:
         "state": state,
     }
     return f"{GOOGLE_AUTHORIZE_URL}?{urlencode(params)}"
+
+
+def build_slack_authorize_url(state: str) -> str:
+    params = {
+        "client_id": settings.slack_client_id,
+        "scope": settings.slack_oauth_scope,
+        "redirect_uri": connector_redirect_uri("slack"),
+        "state": state,
+    }
+    return f"{SLACK_AUTHORIZE_URL}?{urlencode(params)}"
+
 
 
 async def exchange_github_code(code: str) -> dict[str, Any]:
@@ -215,6 +244,24 @@ async def exchange_google_code(code: str) -> dict[str, Any]:
         if token_data.get("error"):
             error_description = token_data.get("error_description") or token_data["error"]
             raise ValueError(error_description)
+        return token_data
+
+
+async def exchange_slack_code(code: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            SLACK_TOKEN_URL,
+            data={
+                "client_id": settings.slack_client_id,
+                "client_secret": settings.slack_client_secret,
+                "code": code,
+                "redirect_uri": connector_redirect_uri("slack"),
+            },
+        )
+        response.raise_for_status()
+        token_data = response.json()
+        if not token_data.get("ok"):
+            raise ValueError(token_data.get("error", "Slack OAuth failed"))
         return token_data
 
 
@@ -285,6 +332,20 @@ async def fetch_google_profile(access_token: str) -> dict[str, Any]:
         userinfo["drive_user"] = about.get("user") or {}
         userinfo["storage_quota"] = about.get("storageQuota") or {}
         return userinfo
+
+
+async def fetch_slack_profile(access_token: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            "https://slack.com/api/auth.test",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        response.raise_for_status()
+        profile = response.json()
+        if not profile.get("ok"):
+            raise ValueError(profile.get("error", "Failed to fetch Slack profile"))
+        return profile
+
 
 
 def _load_google_service_account_info() -> dict[str, Any] | None:
@@ -396,7 +457,7 @@ def remove_connector_account(db: Session, username: str, connector_name: str) ->
 
 def get_connector_accounts_summary(db: Session, username: str) -> list[dict[str, Any]]:
     results = []
-    for connector_name in ("github", "google_drive"):
+    for connector_name in ("github", "google_drive", "slack"):
         account = get_connector_account(db, username, connector_name)
         config = _parse_config(account)
         if connector_name == "github" and account is None and settings.github_pat:
@@ -413,7 +474,22 @@ def get_connector_accounts_summary(db: Session, username: str) -> list[dict[str,
                 }
             )
             continue
+        if connector_name == "slack" and account is None and settings.slack_bot_token:
+            results.append(
+                {
+                    "connector_name": connector_name,
+                    "connected": True,
+                    "auth_method": "bot_token_env",
+                    "display_name": "Shared Slack Bot",
+                    "login": "Bot",
+                    "email": None,
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            )
+            continue
         if connector_name == "google_drive" and account is None and is_google_service_account_runtime_ready():
+
             service_account_summary = google_drive_service_account_summary() or {}
             results.append(
                 {
@@ -571,3 +647,79 @@ def connector_error_html(connector_name: str, message: str) -> str:
     </script>
   </body>
 </html>"""
+def parse_github_url(url: str) -> tuple[str, str] | None:
+    """Parses a GitHub URL and returns (owner, repo)."""
+    # Matches:
+    # https://github.com/owner/repo
+    # github.com/owner/repo
+    # owner/repo
+    pattern = r"(?:https?://)?(?:github\.com/)?([^/]+)/([^/]+?)(?:\.git|/.*)?$"
+    match = re.search(pattern, url)
+    if match:
+        owner = match.group(1)
+        repo = match.group(2)
+        return owner, repo
+    return None
+
+async def fetch_github_repo_structure(owner: str, repo: str, access_token: str | None = None) -> list[dict[str, Any]]:
+    base_headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "Smartbridge-Agent",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    
+    auth_headers = base_headers.copy()
+    if access_token and access_token.strip():
+        auth_headers["Authorization"] = f"Bearer {access_token.strip()}"
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # First try to get the default branch with auth
+        repo_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}"
+        try:
+            repo_res = await client.get(repo_url, headers=auth_headers)
+            if repo_res.status_code == 401:
+                # If 401, try again without auth (maybe repo is public but token is bad)
+                repo_res = await client.get(repo_url, headers=base_headers)
+            repo_res.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise ValueError(f"Repository '{owner}/{repo}' not found or inaccessible.")
+            raise
+
+        repo_data = repo_res.json()
+        default_branch = repo_data.get("default_branch", "main")
+
+        # Now get the tree
+        tree_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1"
+        try:
+            response = await client.get(tree_url, headers=auth_headers)
+            if response.status_code == 401:
+                response = await client.get(tree_url, headers=base_headers)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise ValueError(f"Failed to fetch tree: {e.response.text}") from e
+            
+        tree = response.json().get("tree", [])
+        return tree
+
+async def fetch_github_file_content(owner: str, repo: str, path: str, access_token: str | None = None) -> str:
+    base_headers = {
+        "Accept": "application/vnd.github.v3.raw",
+        "User-Agent": "Smartbridge-Agent",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    
+    auth_headers = base_headers.copy()
+    if access_token and access_token.strip():
+        auth_headers["Authorization"] = f"Bearer {access_token.strip()}"
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{path}"
+        try:
+            response = await client.get(url, headers=auth_headers)
+            if response.status_code == 401:
+                response = await client.get(url, headers=base_headers)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise ValueError(f"Failed to fetch file: {e.response.text}") from e
+        return response.text

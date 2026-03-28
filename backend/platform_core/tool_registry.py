@@ -9,11 +9,11 @@ from sqlalchemy.orm import Session
 
 try:
     import backend.models as models
-    import backend.rag as rag
+    import app.plugins.rag as rag
     from backend.database import engine
 except ImportError:
     import models
-    import rag
+    import app.plugins.rag as rag
     from database import engine
 
 from .doc_sessions import document_session_store

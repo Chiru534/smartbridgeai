@@ -11,9 +11,9 @@ from typing import List
 
 # Reuse the existing embedding infrastructure
 try:
-    import backend.rag as rag
+    import app.plugins.rag as rag
 except ImportError:
-    import rag  # type: ignore[import-untyped]
+    import app.plugins.rag as rag  # type: ignore[import-untyped]
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:

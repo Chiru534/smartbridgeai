@@ -6,9 +6,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 try:
-    import backend.rag as rag
+    import app.plugins.rag as rag
 except ImportError:
-    import rag
+    import app.plugins.rag as rag
 
 from .config import settings
 

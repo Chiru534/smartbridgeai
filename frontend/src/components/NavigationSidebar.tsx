@@ -2,15 +2,15 @@ import {
     LayoutDashboard,
     MessageSquare,
     CheckSquare,
-    Users,
     BookOpen,
     FileSearch,
     Database,
     Github,
     FolderKanban,
-    Bell,
+    Slack,
     Settings
 } from "lucide-react";
+
 
 export type TabId =
     | "dashboard"
@@ -20,11 +20,10 @@ export type TabId =
     | "sqlagent"
     | "githubagent"
     | "driveagent"
+    | "slackagent"
     | "history"
+
     | "tasks"
-    | "team"
-    | "teamchat"
-    | "notifications"
     | "settings";
 
 interface NavigationSidebarProps {
@@ -43,14 +42,13 @@ export function NavigationSidebar({ activeTab, setActiveTab, className = "", onN
         { id: "sqlagent", label: "SQL Agent", icon: Database },
         { id: "githubagent", label: "GitHub Agent", icon: Github },
         { id: "driveagent", label: "Google Drive Agent", icon: FolderKanban },
+        { id: "slackagent", label: "Slack Agent", icon: Slack },
     ];
+
 
     const futureItems = [
         { id: "history", label: "History", icon: BookOpen },
         { id: "tasks", label: "Task Manager", icon: CheckSquare },
-        { id: "team", label: "Team Directory", icon: Users },
-        { id: "teamchat", label: "Team Chat", icon: MessageSquare },
-        { id: "notifications", label: "Notifications", icon: Bell },
         { id: "settings", label: "Settings", icon: Settings },
     ];
 
